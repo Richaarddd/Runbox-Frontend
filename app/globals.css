@@ -1,26 +1,148 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: light;
+  --background: #f6f8fa;
+  --foreground: #12161c;
+  --mute: #5e6875;
+  --line: #e1e6ec;
+  --panel: #ffffff;
+  --term: #f1f4f8;
+  --term-mute: #7a8594;
+  --accent: #3347ff;
+  --on-accent: #ffffff;
 }
 
+/* Dark theme: switched on by data-theme="dark" on the <html> element */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --background: #0e1116;
+  --foreground: #e8ecf1;
+  --mute: #8791a0;
+  --line: #242b35;
+  --panel: #151a21;
+  --term: #0a0d11;
+  --term-mute: #8791a0;
+  --accent: #6f7dff;
+  --on-accent: #0e1116;
+}
+
+/* Colors and fonts become Tailwind classes: bg-background, text-mute,
+   border-line, bg-panel, bg-term, bg-accent, text-on-accent, font-mono ... */
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-mute: var(--mute);
+  --color-line: var(--line);
+  --color-panel: var(--panel);
+  --color-term: var(--term);
+  --color-term-mute: var(--term-mute);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --font-sans: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, Menlo, Consolas, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+/* Animations become classes: animate-blink, animate-slide, animate-line-in */
+@theme {
+  --animate-blink: blink 1s steps(1) infinite;
+  --animate-slide: slide 1s cubic-bezier(0.7, 0, 0.2, 1) infinite;
+  --animate-line-in: line-in 0.18s ease both;
+
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
   }
+  @keyframes slide {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(340%);
+    }
+  }
+  @keyframes line-in {
+    from {
+      opacity: 0;
+      transform: translateX(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+html,
+body {
+  height: 100%;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+/* New terminal output lines slide in from the left */
+@keyframes row-in {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.xterm-rows > div.row-in {
+  animation: row-in 0.22s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+/* Theme switch: the new theme is revealed by a growing circle (see changeTheme) */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-old(root) {
+  z-index: 1;
+}
+::view-transition-new(root) {
+  z-index: 2;
+}
+
+/* While the switch is captured, no element may be caught half-way between colors */
+html.theme-switching,
+html.theme-switching * {
+  transition: none !important;
+}
+
+/* Fallback for browsers without view transitions: colors fade instead */
+html.theme-fade,
+html.theme-fade * {
+  transition:
+    background-color 0.35s ease,
+    border-color 0.35s ease,
+    color 0.35s ease !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
+  }
 }
