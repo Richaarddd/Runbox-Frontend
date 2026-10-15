@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import {
   AnimatePresence,
   motion,
   useReducedMotion,
   type Variants,
 } from "motion/react";
+import AiPanel, { type AiView } from "@/components/AiPanel";
 import CodeEditor from "@/components/CodeEditor";
 import { useDialog } from "@/components/Dialog";
 import LanguageSelect from "@/components/LanguageSelect";
@@ -16,7 +17,15 @@ import SettingsPanel from "@/components/SettingsPanel";
 import Terminal, { type TerminalHandle } from "@/components/Terminal";
 import FileTabs from "@/components/FileTabs";
 import { DEFAULT_CODE, LANGUAGES } from "@/constants/defaultCode";
-import { startRun, type RunHandle, type ServerMessage } from "@/lib/runCode";
+import { explainError, fixCode } from "@/lib/ai";
+import {
+  checkProject,
+  startRun,
+  type CheckHandle,
+  type FileDiagnostic,
+  type RunHandle,
+  type ServerMessage,
+} from "@/lib/runCode";
 import { decodeShare, encodeShare } from "@/lib/share";
 import {
   DEFAULT_SETTINGS,
@@ -34,9 +43,12 @@ import {
   MAX_FILES,
   MAX_FILE_LENGTH,
   type Project,
+  type ProjectFile,
 } from "@/lib/project";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { flushSync } from "react-dom";
+import AiButtons from "@/components/AiButtons";
+import ChatWidget from "@/components/ChatWidget";
 
 const RED = "\x1b[31m";
 const GRAY = "\x1b[90m";
@@ -46,7 +58,7 @@ const FULL = "inset(0px 0px 0px 0px round 0px)";
 const ghost =
   "rounded-full border border-line bg-panel px-4 py-1.5 text-sm transition hover:border-mute active:scale-95 disabled:cursor-not-allowed disabled:opacity-40";
 
-function exitText(msg: Extract<ServerMessage, { type: "exit" }>) {
+  function exitText(msg: Extract<ServerMessage, { type: "exit" }>) {
   if (msg.reason === "timeout") return "Time limit exceeded. Program stopped.";
   if (msg.reason === "output") return "Output limit exceeded. Program stopped.";
   if (msg.reason === "stopped") return "Program stopped.";
@@ -59,7 +71,16 @@ const MAX_UPLOAD_BYTES = 100 * 1024;
 const MAX_SHARE_URL = 8000; // longer links break in many chat apps
 const MAX_STDIN = 20000;
 const STDIN_DELAY_MS = 600; // raise this if compiled languages miss their input
+const CHECK_DELAY_MS = 1000; // how long you must stop typing before the code is checked
+const MAX_ERROR_TEXT = 4000; // how much error text we keep for the AI buttons
 const keyStdin = (lang: string) => `compiler:stdin:${lang}`;
+
+// Keeps the start and the end of a long error, because both matter
+function capError(text: string) {
+  if (text.length <= MAX_ERROR_TEXT) return text;
+  const half = MAX_ERROR_TEXT / 2;
+  return text.slice(0, half) + "\n...\n" + text.slice(-half);
+}
 
 function loadStdin(lang: string): string {
   try {
@@ -132,6 +153,28 @@ export default function Home() {
   const [settings, setSettings] = useState<EditorSettings>(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<FileDiagnostic[]>([]);
+
+  // The error from the last run, together with the files it belongs to
+  const [runError, setRunError] = useState<{ text: string; files: ProjectFile[] } | null>(null);
+  const [ai, setAi] = useState<AiView | null>(null);
+  const aiAbort = useRef<AbortController | null>(null);
+
+  // Only the errors that belong to the tab being shown
+  const projectBlank = project.files.every((f) => !f.code.trim());
+  const fileDiagnostics = useMemo(
+    () =>
+      projectBlank ? [] : diagnostics.filter((d) => d.file === activeFile.name),
+    [diagnostics, projectBlank, activeFile.name]
+  );
+
+  // What the AI buttons would send: the last run's error while the code is unchanged
+  // since then, otherwise the errors the editor is showing
+  const diagnosticText = fileDiagnostics
+    .map((d) => `${d.file}:${d.line}:${d.column}: ${d.message}`)
+    .join("\n");
+  const aiErrorText =
+    runError && runError.files === project.files ? runError.text : diagnosticText;
 
   const termRef = useRef<TerminalHandle>(null);
   const wide = useIsWide();
@@ -146,7 +189,13 @@ export default function Home() {
   }
 
   // Close any open connection when leaving the page
-  useEffect(() => () => runRef.current?.close(), []);
+  useEffect(
+    () => () => {
+      runRef.current?.close();
+      aiAbort.current?.abort();
+    },
+    []
+  );
 
   // Load the saved language, project and settings once, after the page mounts
   useEffect(() => {
@@ -224,6 +273,24 @@ export default function Home() {
     if (loaded) document.documentElement.dataset.theme = settings.theme;
   }, [settings.theme, loaded]);
 
+  // Syntax-check the whole project about a second after you stop typing.
+  // Every change cancels the check in flight, so only the latest code is ever checked.
+  // Switching tabs doesn't count as a change, because project.files stays the same.
+  useEffect(() => {
+    if (!loaded || view !== "editor") return;
+    if (project.files.every((f) => !f.code.trim())) return;
+
+    let handle: CheckHandle | null = null;
+    const timer = setTimeout(() => {
+      handle = checkProject(language, project.files, setDiagnostics);
+    }, CHECK_DELAY_MS);
+
+    return () => {
+      clearTimeout(timer);
+      handle?.cancel();
+    };
+  }, [project.files, language, loaded, view]);
+
   // Switching theme: a circle of the new theme grows out of the clicked button
   function changeTheme(next: Theme, origin: { x: number; y: number }) {
     if (next === settings.theme) return;
@@ -291,16 +358,131 @@ export default function Home() {
 
   function closeEditor() {
     runRef.current?.stop();
+    closeAi();
     setSettingsOpen(false);
     setView("landing");
   }
 
   function handleLanguageChange(next: string) {
     runRef.current?.stop();
+    closeAi();
+    setRunError(null);
+    setDiagnostics([]); // errors from the old language don't apply here
     setLanguage(next);
     setStdin(loadStdin(next));
     setProject(loadProject(next, mainName(next), DEFAULT_CODE[next] ?? ""));
     termRef.current?.clear();
+  }
+
+  function closeAi() {
+    aiAbort.current?.abort();
+    aiAbort.current = null;
+    setAi(null);
+  }
+
+  // Asks the AI about the file that is open, using the current error
+  async function askAi(mode: "explain" | "fix") {
+    if (!aiErrorText || running) return;
+
+    const fileName = activeFile.name;
+    const sourceCode = code;
+
+    aiAbort.current?.abort();
+    const controller = new AbortController();
+    aiAbort.current = controller;
+    setAi({ mode, status: "loading", text: "", fileName });
+
+    try {
+      const request = { language, fileName, code: sourceCode, error: aiErrorText };
+      const result =
+        mode === "explain"
+          ? await explainError(request, controller.signal)
+          : await fixCode(request, controller.signal);
+      setAi({
+        mode,
+        status: "done",
+        text: result.explanation,
+        fixedCode: result.fixedCode,
+        sourceCode,
+        fileName,
+      });
+    } catch (err) {
+      if (controller.signal.aborted) return; // the panel was closed
+      setAi({
+        mode,
+        status: "error",
+        text: err instanceof Error ? err.message : "Something went wrong.",
+        fileName,
+      });
+    }
+  }
+
+    // Puts a file the chat suggested into the editor (only when the user clicks Apply)
+  async function applyFromChat(
+    fileName: string,
+    fixed: string,
+    sourceCode: string
+  ): Promise<boolean> {
+    const target = project.files.find((f) => f.name === fileName);
+    if (!target) {
+      showToast("That file no longer exists");
+      return false;
+    }
+    if (fixed.length > MAX_FILE_LENGTH) {
+      showToast("That change is too long to apply");
+      return false;
+    }
+    if (target.code !== sourceCode) {
+      const ok = await dialog.confirm({
+        title: "Apply anyway?",
+        message:
+          "This file changed after the assistant looked at it. The change will replace its current code.",
+        confirmLabel: "Apply",
+        danger: true,
+      });
+      if (!ok) return false;
+    }
+
+    setProject((p) => ({
+      ...p,
+      files: p.files.map((f) => (f.name === fileName ? { ...f, code: fixed } : f)),
+    }));
+    showToast("Applied. Ctrl+Z in the editor should undo it.");
+    return true;
+  }
+
+  // Puts the AI's corrected file into the editor (only when the user clicks Apply)
+  async function applyFix() {
+    if (!ai?.fixedCode) return;
+    const fileName = ai.fileName;
+    const fixed = ai.fixedCode;
+
+    const target = project.files.find((f) => f.name === fileName);
+    if (!target) {
+      showToast("That file no longer exists");
+      closeAi();
+      return;
+    }
+    if (fixed.length > MAX_FILE_LENGTH) {
+      showToast("The fix is too long to apply");
+      return;
+    }
+    if (target.code !== ai.sourceCode) {
+      const ok = await dialog.confirm({
+        title: "Apply anyway?",
+        message: "This file changed after the AI looked at it. The fix will replace its current code.",
+        confirmLabel: "Apply",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+
+    setProject((p) => ({
+      ...p,
+      files: p.files.map((f) => (f.name === fileName ? { ...f, code: fixed } : f)),
+    }));
+    closeAi();
+    showToast("Fix applied. Ctrl+Z in the editor should undo it.");
   }
 
   async function handleShare() {
@@ -454,18 +636,22 @@ export default function Home() {
     const term = termRef.current;
     term?.clear();
     setRunning(true);
+    setRunError(null);
 
     const input = stdin;
     let sent = input.length === 0;
+    let errText = ""; // everything the program wrote to stderr, kept for the AI buttons
+    const filesAtRun = project.files;
 
-    // Runs the main file (first tab), not whichever tab is open
-    const handle = startRun(language, project.files[0].code, {
+    // Sends every tab. The first tab is the entry point, not whichever tab is open.
+    const handle = startRun(language, project.files, {
       onMessage: (msg) => {
         if (msg.type === "stdout") {
           sendStdin(); // the program is running, so it can take input
           term?.write(msg.data);
         } else if (msg.type === "stderr") {
           sendStdin();
+          errText = capError(errText + msg.data);
           term?.write(RED + msg.data + RESET);
         } else if (msg.type === "info") {
           term?.write(GRAY + msg.data + RESET);
@@ -474,6 +660,16 @@ export default function Home() {
           finish();
         } else if (msg.type === "exit") {
           term?.write(`\n${GRAY}${exitText(msg)}${RESET}\n`);
+
+          // A failed run (not one you stopped yourself) can be explained by the AI
+          const failed =
+            msg.reason !== "stopped" &&
+            (msg.reason !== null || (msg.exitCode !== null && msg.exitCode !== 0));
+          const failure =
+            errText.trim() ||
+            (msg.reason === "timeout" || msg.reason === "output" ? exitText(msg) : "");
+          if (failed && failure) setRunError({ text: failure, files: filesAtRun });
+
           finish();
         }
       },
@@ -649,6 +845,7 @@ export default function Home() {
                           tabSize={settings.tabSize}
                           wordWrap={settings.wordWrap}
                           dark={settings.theme === "dark"}
+                          diagnostics={fileDiagnostics}
                         />
                       </div>
 
@@ -705,7 +902,7 @@ export default function Home() {
 
                   <Panel defaultSize={50} minSize={20}>
                     <motion.section
-                      className="flex h-full min-h-0 flex-col gap-1.5"
+                      className="relative flex h-full min-h-0 flex-col gap-1.5"
                       initial={{ opacity: 0, x: 16 }}
                       animate={{ opacity: 1, x: 0 }}
                       transition={{
@@ -714,12 +911,17 @@ export default function Home() {
                         ease: [0.2, 0.7, 0.2, 1],
                       }}
                     >
-                      <div className="flex items-center gap-2">
+                      <div className="flex min-h-7 items-center gap-2">
                         <span className="text-sm font-semibold text-mute">Terminal</span>
                         <span
                           className={`h-1.5 w-1.5 rounded-full transition-colors duration-300 ${
                             running ? "animate-pulse bg-accent" : "bg-line"
                           }`}
+                        />
+                         <AiButtons
+                          ready={!!aiErrorText && !running}
+                          onExplain={() => askAi("explain")}
+                          onFix={() => askAi("fix")}
                         />
                       </div>
                       <div
@@ -741,6 +943,25 @@ export default function Home() {
                           onInterrupt={() => runRef.current?.stop()}
                           dark={settings.theme === "dark"}
                         />
+                        <ChatWidget
+                        language={language}
+                        fileName={activeFile.name}
+                        code={code}
+                        errorText={aiErrorText}
+                        onApply={applyFromChat}
+                      />
+                        <AnimatePresence>
+                        {ai && (
+                          <AiPanel
+                            view={ai}
+                            errorText={aiErrorText}
+                            onClose={closeAi}
+                            onApply={applyFix}
+                            onFix={() => askAi("fix")}
+                          />
+                        )}
+                      </AnimatePresence>
+                        
                       </div>
                     </motion.section>
                   </Panel>
@@ -761,26 +982,6 @@ export default function Home() {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* Small confirmation message, e.g. "Link copied" */}
-      <div className="pointer-events-none fixed inset-x-0 bottom-6 z-[80] flex justify-center">
-        <AnimatePresence>
-          {toast && (
-            <motion.div
-              key={toast}
-              role="status"
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 16 }}
-              transition={{ duration: 0.2 * t }}
-              className="rounded-full bg-foreground px-5 py-2.5 text-sm font-medium text-background"
-            >
-              {toast}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-
       {dialog.element}
     </>
   );

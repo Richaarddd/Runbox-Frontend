@@ -146,3 +146,24 @@ html.theme-fade * {
     transition-delay: 0s !important;
   }
 }
+
+/* Loading placeholder lines in the AI panel */
+@keyframes ai-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.ai-skel {
+  display: block;
+  height: 11px;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    var(--term) 25%,
+    color-mix(in srgb, var(--accent) 22%, var(--term)) 50%,
+    var(--term) 75%
+  );
+  background-size: 200% 100%;
+  animation: ai-shimmer 1.3s linear infinite;
+}
