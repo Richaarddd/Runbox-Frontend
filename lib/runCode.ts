@@ -20,7 +20,8 @@ export type FileDiagnostic = Diagnostic & { file: string }; // file = the tab's 
 export type CheckHandle = { cancel: () => void };
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:5000/ws";
-
+console.log("[run] WS_URL =", WS_URL);
+console.log("[run] url", WS_URL);
 // Runs the project. The first file is the entry point.
 export function startRun(
   language: string,
@@ -33,14 +34,23 @@ export function startRun(
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   };
 
-  ws.onopen = () => send({ type: "run", language, files });
+    ws.onopen = () => {
+    console.log("[run] open, sending", { language, files });
+    send({ type: "run", language, files });
+  };
 
   ws.onmessage = (event) => {
+    console.log("[run] message", event.data);
     try {
       handlers.onMessage(JSON.parse(event.data));
     } catch {
       // ignore malformed messages
     }
+  };
+
+  ws.onclose = (e) => {
+    console.log("[run] closed", e.code, e.reason);
+    handlers.onClose();
   };
 
   ws.onerror = () =>
@@ -56,6 +66,8 @@ export function startRun(
     stop: () => send({ type: "kill" }),
     close: () => ws.close(),
   };
+
+  
 }
 
 // Asks the backend to syntax-check every file, without running anything.
